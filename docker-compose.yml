@@ -1,0 +1,24 @@
+services:
+  # 画面を出す Web サーバー(Laravel)
+  app:
+    build: .
+    ports:
+      # ホストの http://localhost:8000 → コンテナの 8000 番へ
+      - "8000:8000"
+    volumes:
+      # プロジェクトをまるごとマウント。ファイルを編集すると即反映される(開発向け)。
+      - .:/app
+    env_file:
+      - .env
+
+  # ブラウザ↔OpenAI を中継する WebSocket サーバー(本物のキーはここだけで使う)
+  relay:
+    build: .
+    command: php artisan realtime:relay --host=0.0.0.0 --port=8081
+    ports:
+      # ブラウザが ws://localhost:8081 で接続する
+      - "8081:8081"
+    volumes:
+      - .:/app
+    env_file:
+      - .env
