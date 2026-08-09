@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     {{-- ブラウザが接続する中継WebSocketサーバーのポート --}}
     <meta name="relay-port" content="{{ $relayPort }}">
-    <title>OpenAI Realtime 音声チャット</title>
+    <title>OpenAI Realtime 音声チャットサンプル</title>
     <style>
         :root { color-scheme: light dark; }
         body {
@@ -53,23 +53,52 @@
             min-height: 60px;
         }
         .bubble {
-            max-width: 80%; padding: 10px 14px; border-radius: 14px;
+            display: flex; gap: 8px; align-items: flex-start; max-width: 85%;
+        }
+        .bubble .avatar { font-size: 1.5rem; line-height: 1.3; flex: 0 0 auto; }
+        .bubble .body {
+            padding: 10px 14px; border-radius: 14px;
             white-space: pre-wrap; word-break: break-word; line-height: 1.5;
         }
         .bubble .who { display: block; font-size: .7rem; opacity: .6; margin-bottom: 2px; }
-        .bubble.user { align-self: flex-end; background: #2563eb22; border: 1px solid #2563eb55; }
-        .bubble.ai   { align-self: flex-start; background: #8882; border: 1px solid #8884; }
+        .bubble.user { align-self: flex-end; flex-direction: row-reverse; }
+        .bubble.ai   { align-self: flex-start; }
+        .bubble.user .body { background: #2563eb22; border: 1px solid #2563eb55; }
+        .bubble.ai   .body { background: #8882; border: 1px solid #8884; }
         .bubble.pending { opacity: .6; }
         details#raw { margin-top: 20px; }
         details#raw summary { cursor: pointer; color: #888; font-size: .85rem; }
+        /* 折りたたみ設定 */
+        details.settings {
+            border: 1px solid #8884; border-radius: 12px; padding: 4px 16px 8px; margin: 0 0 20px;
+        }
+        details.settings > summary {
+            font-weight: 600; font-size: .9rem; cursor: pointer; padding: 10px 0; list-style: none;
+        }
+        details.settings > summary::-webkit-details-marker { display: none; }
+        details.settings > summary::before { content: '▸ '; }
+        details.settings[open] > summary::before { content: '▾ '; }
+        details.settings[open] { padding-bottom: 16px; }
+        /* 心電図モニタ(左=あなた / 右=AI) */
+        .monitors { display: flex; gap: 12px; margin: 16px 0 6px; }
+        .monitor {
+            flex: 1; display: flex; flex-direction: column; align-items: center; gap: 6px;
+        }
+        .monitor canvas {
+            display: block; width: 100%; height: 90px;
+            border-radius: 10px; background: #08120d;
+        }
+        .monitor .avatar { font-size: 1.6rem; line-height: 1; transition: transform .1s; }
+        .monitor.active .avatar { transform: scale(1.18); }
+        .monitor .mon-label { font-size: .72rem; color: #888; }
     </style>
 </head>
 <body>
-    <h1>🎙️ OpenAI Realtime 音声チャット</h1>
+    <h1>🎙️ OpenAI Realtime 音声チャットサンプル</h1>
     <p class="hint">設定を選んで「接続」を押し、マイクを許可して話しかけてください。AIが音声で返事します。</p>
 
-    <fieldset>
-        <legend>設定(接続時に反映)</legend>
+    <details class="settings" open>
+        <summary>設定(接続時に反映)</summary>
         <div class="grid">
             <div class="field">
                 <label for="model">モデル</label>
@@ -151,15 +180,29 @@
 
             <div class="field full">
                 <label for="instructions">指示 (instructions)</label>
-                <textarea id="instructions">あなたは親しみやすい日本語の音声アシスタントです。相手の発話に、短く自然な話し言葉で、日本語で答えてください。</textarea>
+                <textarea id="instructions" placeholder="空欄ならサーバー既定を使います">関西弁で、短く自然な話し言葉で答えてください。</textarea>
             </div>
         </div>
-    </fieldset>
+    </details>
 
     <div id="status" class="status">未接続</div>
     <div>
         <button id="connect">接続して話す</button>
         <button id="disconnect" disabled>切断</button>
+    </div>
+
+    {{-- 心電図モニタ。吹き出しと揃えて 左=AI / 右=あなた。自分の音声だけで振れる --}}
+    <div class="monitors">
+        <div class="monitor" id="mon-ai">
+            <div class="avatar">🤖</div>
+            <canvas id="viz-ai"></canvas>
+            <div class="mon-label">AI</div>
+        </div>
+        <div class="monitor" id="mon-you">
+            <div class="avatar">🧑</div>
+            <canvas id="viz-you"></canvas>
+            <div class="mon-label">あなた</div>
+        </div>
     </div>
 
     {{-- 会話の字幕(あなた/AI の発話をテキスト表示) --}}

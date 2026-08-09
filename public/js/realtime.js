@@ -30,6 +30,13 @@ let curItemStart = null;   // そのアイテムの音声が鳴り始める時�
 let curItemMs = 0;         // そのアイテムの受信済み音声の合計(ミリ秒)
 let captionRAF = null;     // 字幕を再生に同期させる requestAnimationFrame ハンドル
 
+let inputAnalyser = null;  // マイク音量の解析(あなたのモニタ用)
+let outputAnalyser = null; // AI音声の音量解析(AIのモニタ用)
+let vizRAF = null;         // 波形描画ループ
+const SWEEP_SPEED = 2;     // 書き込みヘッドが1フレームで進むドット数
+const SWEEP_GAP = 12;      // ヘッド直前の消去バーの幅
+const MONITOR_H = 90;      // 各モニタの高さ(CSSと一致させる)
+
 const SAMPLE_RATE = 24000;
 
 function setStatus(text, kind = '') {
@@ -88,7 +95,8 @@ function playPCM16(b64, itemId) {
     buf.getChannelData(0).set(float32);
     const src = outputCtx.createBufferSource();
     src.buffer = buf;
-    src.connect(outputCtx.destination);
+    // 波形表示のため解析ノード経由で再生(無ければ直接出力)
+    src.connect(outputAnalyser || outputCtx.destination);
 
     const now = outputCtx.currentTime;
     if (playHead < now) playHead = now;
@@ -151,17 +159,124 @@ function tickCaptions() {
     }
 }
 
+// ===== 音量ビジュアル(左右2つの心電図モニタ)=====
+// 左=あなた(マイク)、右=AI(出力音声)。各モニタは自分の音量だけで振れる。
+// 波形は固定枠に描かれ、書き込みヘッドが左→右に走って古い波形を上書きしていく。
+function rms(analyser, buf) {
+    analyser.getFloatTimeDomainData(buf);
+    let sum = 0;
+    for (let i = 0; i < buf.length; i++) sum += buf[i] * buf[i];
+    return Math.sqrt(sum / buf.length);
+}
+
+function makeMonitor(canvasId, color, analyserGetter) {
+    const canvas = document.getElementById(canvasId);
+    return {
+        canvas,
+        ctx: canvas ? canvas.getContext('2d') : null,
+        panel: canvas ? canvas.closest('.monitor') : null,
+        color,
+        analyserGetter,
+        cols: 0, head: 0, traceY: null, buf: null,
+    };
+}
+
+// 解析ノードは接続時に生成されるので、getter で都度参照する
+const monitors = [
+    makeMonitor('viz-you', '#4a9eff', () => inputAnalyser),
+    makeMonitor('viz-ai', '#22c55e', () => outputAnalyser),
+].filter(m => m.ctx);
+
+function setupViz() {
+    const dpr = window.devicePixelRatio || 1;
+    for (const m of monitors) {
+        const w = m.canvas.clientWidth || 320;
+        m.canvas.width = w * dpr;
+        m.canvas.height = MONITOR_H * dpr;
+        m.ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+        m.cols = Math.floor(w);
+        m.traceY = new Float32Array(m.cols).fill(NaN); // NaN = 未描画
+        m.head = 0;
+        m.buf = null;
+    }
+}
+
+function drawGrid(ctx, w, mid) {
+    ctx.strokeStyle = 'rgba(120,160,140,.10)';
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    for (let x = 0; x <= w; x += 24) { ctx.moveTo(x, 0); ctx.lineTo(x, MONITOR_H); }
+    for (let y = 0; y <= MONITOR_H; y += 24) { ctx.moveTo(0, y); ctx.lineTo(w, y); }
+    ctx.stroke();
+    ctx.strokeStyle = 'rgba(120,160,140,.22)';
+    ctx.beginPath(); ctx.moveTo(0, mid); ctx.lineTo(w, mid); ctx.stroke();
+}
+
+function drawMonitor(m) {
+    if (!m.traceY) return;
+    const mid = MONITOR_H / 2;
+
+    // 音量(0〜1に少し強調してクランプ)
+    let level = 0;
+    const an = m.analyserGetter();
+    if (an) { m.buf = m.buf || new Float32Array(an.fftSize); level = Math.min(1, rms(an, m.buf) * 4); }
+    const y = mid - level * (mid - 5);
+
+    // ヘッドを進めながら書き込み、直前を消去バーで空ける
+    for (let s = 0; s < SWEEP_SPEED; s++) {
+        m.traceY[m.head] = y;
+        m.traceY[(m.head + SWEEP_GAP) % m.cols] = NaN;
+        m.head = (m.head + 1) % m.cols;
+    }
+
+    const w = m.canvas.clientWidth || m.cols;
+    const ctx = m.ctx;
+    ctx.clearRect(0, 0, w, MONITOR_H);
+    drawGrid(ctx, w, mid);
+
+    // 波形(NaN の切れ目で線を分ける)
+    ctx.beginPath();
+    let started = false;
+    for (let i = 0; i < m.cols; i++) {
+        const yy = m.traceY[i];
+        if (Number.isNaN(yy)) { started = false; continue; }
+        started ? ctx.lineTo(i, yy) : (ctx.moveTo(i, yy), started = true);
+    }
+    ctx.strokeStyle = m.color;
+    ctx.lineWidth = 1.8;
+    ctx.stroke();
+
+    // 書き込みヘッド
+    ctx.fillStyle = 'rgba(255,255,255,.5)';
+    ctx.fillRect(m.head, 0, 1.5, MONITOR_H);
+
+    // 喋っている側のアイコンを強調
+    if (m.panel) m.panel.classList.toggle('active', level > 0.08);
+}
+
+function drawViz() {
+    vizRAF = requestAnimationFrame(drawViz);
+    for (const m of monitors) drawMonitor(m);
+}
+
 // ===== 字幕(会話の文字起こし)=====
 function getBubble(itemId, role) {
     let b = bubbles.get(itemId);
     if (!b) {
         const el = document.createElement('div');
         el.className = 'bubble pending ' + role;
+        const avatar = document.createElement('span');
+        avatar.className = 'avatar';
+        avatar.textContent = role === 'user' ? '🧑' : '🤖';
+        const body = document.createElement('div');
+        body.className = 'body';
         const who = document.createElement('span');
         who.className = 'who';
         who.textContent = role === 'user' ? 'あなた' : 'AI';
         const text = document.createElement('span');
-        el.append(who, text);
+        text.className = 'text';
+        body.append(who, text);
+        el.append(avatar, body);
         transcriptEl.appendChild(el);
         b = { el, textEl: text };
         bubbles.set(itemId, b);
@@ -256,15 +371,16 @@ function onServerEvent(e) {
 }
 
 // ===== 画面の設定 → session.update を組み立てる =====
+// instructions を入れると、中継サーバーが送った既定を上書きする(空欄なら既定のまま)。
 function buildSessionUpdate(s) {
     const session = {
         type: 'realtime',
-        instructions: s.instructions,
         audio: {
             input: {},
             output: { voice: s.voice },
         },
     };
+    if (s.instructions) session.instructions = s.instructions;
     if (s.temperature != null) session.temperature = s.temperature;
 
     if (s.turn_detection_type === 'server_vad') {
@@ -282,6 +398,9 @@ function buildSessionUpdate(s) {
 
     if (s.transcription_model) {
         session.audio.input.transcription = { model: s.transcription_model };
+    } else {
+        // サーバーが初期設定で有効にしているため、「なし」は明示的に無効化して上書きする
+        session.audio.input.transcription = null;
     }
 
     return { type: 'session.update', session };
@@ -317,9 +436,10 @@ function collectSettings() {
     const body = {
         model: document.getElementById('model').value,
         voice: document.getElementById('voice').value,
-        instructions: document.getElementById('instructions').value,
         turn_detection_type: vadTypeEl.value,
     };
+    const ins = document.getElementById('instructions').value.trim();
+    if (ins) body.instructions = ins;
     if (document.getElementById('temperature-enabled').checked) {
         body.temperature = parseFloat(document.getElementById('temperature').value);
     }
@@ -358,7 +478,7 @@ async function connect() {
         });
         log('中継サーバーに接続 / model =', settings.model);
 
-        // 2. セッション設定を送る(voice/VAD/文字起こし/instructions)
+        // 2. 画面の設定を送る(voice/VAD/文字起こし。instructionsはサーバー側)
         ws.send(JSON.stringify(buildSessionUpdate(settings)));
 
         // 3. 再生用コンテキストを用意(ボタン操作直後なので自動再生ポリシーOK)
@@ -368,9 +488,17 @@ async function connect() {
         curItemId = null;
         curItemStart = null;
         curItemMs = 0;
+        // AI音声の音量を測る解析ノード(destination へ中継)
+        outputAnalyser = outputCtx.createAnalyser();
+        outputAnalyser.fftSize = 2048;
+        outputAnalyser.connect(outputCtx.destination);
         // 字幕を再生に同期させるループを開始
         if (captionRAF) cancelAnimationFrame(captionRAF);
         captionRAF = requestAnimationFrame(tickCaptions);
+        // 波形表示のループを開始
+        setupViz();
+        if (vizRAF) cancelAnimationFrame(vizRAF);
+        vizRAF = requestAnimationFrame(drawViz);
 
         // 4. マイクを取得して PCM16 で送信
         setStatus('マイク取得中…');
@@ -379,6 +507,10 @@ async function connect() {
         await inputCtx.resume();
 
         const source = inputCtx.createMediaStreamSource(micStream);
+        // マイク音量を測る解析ノード(タップするだけ)
+        inputAnalyser = inputCtx.createAnalyser();
+        inputAnalyser.fftSize = 2048;
+        source.connect(inputAnalyser);
         processor = inputCtx.createScriptProcessor(4096, 1, 1);
         source.connect(processor);
         // ScriptProcessor は destination に繋がないと発火しないため、
@@ -410,6 +542,13 @@ async function connect() {
 
 function cleanup() {
     if (captionRAF) { cancelAnimationFrame(captionRAF); captionRAF = null; }
+    if (vizRAF) { cancelAnimationFrame(vizRAF); vizRAF = null; }
+    inputAnalyser = null;
+    outputAnalyser = null;
+    for (const m of monitors) {
+        if (m.ctx) m.ctx.clearRect(0, 0, m.canvas.width, m.canvas.height);
+        if (m.panel) m.panel.classList.remove('active');
+    }
     if (processor) { processor.onaudioprocess = null; try { processor.disconnect(); } catch (e) {} processor = null; }
     if (micStream) { micStream.getTracks().forEach(t => t.stop()); micStream = null; }
     if (inputCtx) { inputCtx.close(); inputCtx = null; }
